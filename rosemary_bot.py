@@ -7,6 +7,7 @@ from discord.ext import commands
 import os
 import aiohttp
 import tempfile
+import asyncio
 from typing import Optional, List
 from datetime import datetime
 
@@ -28,7 +29,7 @@ class RosemaryBot(commands.Bot):
 
         self.channel_id = channel_id
         self.data_store = TrainerDataStore()
-        self.startup_complete = False
+        self.processing_history = False  # Track if we're still processing history
 
     async def setup_hook(self):
         """Set up the bot before it starts."""
@@ -41,13 +42,14 @@ class RosemaryBot(commands.Bot):
         print(f'Logged in as {self.user} (ID: {self.user.id})')
         print('------')
 
-        # Process historical messages on first startup
-        if not self.startup_complete:
-            await self.process_channel_history()
-            self.startup_complete = True
+        # Process channel history in background (will resume from last processed message)
+        # This allows the bot to respond to commands while processing
+        if not self.processing_history:
+            self.loop.create_task(self.process_channel_history())
 
     async def process_channel_history(self):
-        """Process all historical messages in the configured channel."""
+        """Process all historical messages in the configured channel, resuming from last processed."""
+        self.processing_history = True
         print("Processing channel history...")
 
         channel = self.get_channel(self.channel_id)
@@ -61,24 +63,42 @@ class RosemaryBot(commands.Bot):
             print("  2. The channel ID is incorrect")
             print("  3. The bot lacks permissions to view the channel")
             print(f"\nRun 'python diagnose_bot.py' for detailed diagnostics")
+            self.processing_history = False
             return
+
+        # Get the last processed message ID to resume from there
+        last_processed_id = self.data_store.get_last_processed_message()
+
+        if last_processed_id:
+            print(f"Resuming from message ID {last_processed_id}")
+            # Create a dummy message object with just the ID to use as 'after' parameter
+            after_snowflake = discord.Object(id=last_processed_id)
+        else:
+            print("Starting from beginning of channel history")
+            after_snowflake = None
 
         message_count = 0
         image_count = 0
+        processed_image_count = 0
 
         try:
-            # Fetch messages from oldest to newest
+            # Fetch messages after the last processed one, from oldest to newest
             messages = []
-            async for message in channel.history(limit=None, oldest_first=True):
+            print("Fetching message history...")
+            async for message in channel.history(limit=None, after=after_snowflake, oldest_first=True):
                 messages.append(message)
+                # Yield control to event loop periodically
+                if len(messages) % 100 == 0:
+                    await asyncio.sleep(0)
 
-            print(f"Found {len(messages)} historical messages to process")
+            if len(messages) == 0:
+                print("No new messages to process")
+                self.processing_history = False
+                return
 
-            for message in messages:
-                # Skip if already processed
-                if self.data_store.is_message_processed(message.id):
-                    continue
+            print(f"Found {len(messages)} new messages to process")
 
+            for idx, message in enumerate(messages):
                 message_count += 1
 
                 # Process attachments
@@ -86,20 +106,36 @@ class RosemaryBot(commands.Bot):
                     for attachment in message.attachments:
                         if self._is_image(attachment):
                             image_count += 1
-                            await self._process_image(
+                            print(f"Processing image {image_count} from {message.author.name}...")
+                            success = await self._process_image(
                                 attachment,
                                 message.author,
                                 message.created_at,
                                 silent=True  # Don't send error messages for historical data
                             )
+                            if success:
+                                processed_image_count += 1
 
-                # Mark as processed
+                            # Rate limit: small delay between images to prevent blocking
+                            await asyncio.sleep(0.5)
+
+                # Mark as processed (keep for backwards compatibility)
                 self.data_store.mark_message_processed(message.id)
 
-            print(f"Processed {message_count} messages with {image_count} images from history")
+                # Update the last processed message
+                self.data_store.update_last_processed_message(message.id, message.created_at)
+
+                # Yield control to event loop every few messages
+                if idx % 10 == 0:
+                    await asyncio.sleep(0)
+
+            print(f"Processed {message_count} messages with {processed_image_count}/{image_count} images successfully")
+            print("Channel history processing complete")
 
         except Exception as e:
             print(f"Error processing channel history: {e}")
+        finally:
+            self.processing_history = False
 
     async def on_message(self, message: discord.Message):
         """Handle new messages."""
@@ -127,8 +163,11 @@ class RosemaryBot(commands.Bot):
                         silent=False  # Send error messages for new images
                     )
 
-        # Mark as processed
+        # Mark as processed (keep for backwards compatibility)
         self.data_store.mark_message_processed(message.id)
+
+        # Update the last processed message
+        self.data_store.update_last_processed_message(message.id, message.created_at)
 
     def _is_image(self, attachment: discord.Attachment) -> bool:
         """Check if an attachment is an image."""
@@ -141,7 +180,7 @@ class RosemaryBot(commands.Bot):
                             author: discord.User,
                             timestamp: datetime,
                             channel: Optional[discord.TextChannel] = None,
-                            silent: bool = False):
+                            silent: bool = False) -> bool:
         """
         Download and process an image attachment.
 
@@ -151,6 +190,9 @@ class RosemaryBot(commands.Bot):
             timestamp: When the message was posted
             channel: Channel to send error messages to (if not silent)
             silent: If True, don't send error messages
+
+        Returns:
+            True if successfully processed, False otherwise
         """
         temp_file = None
 
@@ -163,16 +205,18 @@ class RosemaryBot(commands.Bot):
                             await channel.send(
                                 f"{author.mention} I couldn't download your image. Please try again."
                             )
-                        return
+                        return False
 
                     # Save to temporary file
                     with tempfile.NamedTemporaryFile(mode='wb', suffix='.png', delete=False) as f:
                         temp_file = f.name
                         f.write(await resp.read())
 
-            # Parse the trainer card
+            # Parse the trainer card - run in executor to avoid blocking event loop
             try:
-                result = parse_trainer_card(temp_file)
+                loop = asyncio.get_event_loop()
+                # Run the blocking parse_trainer_card in a thread pool
+                result = await loop.run_in_executor(None, parse_trainer_card, temp_file)
 
                 # Store the data
                 self.data_store.record_trainer_card(
@@ -187,6 +231,7 @@ class RosemaryBot(commands.Bot):
                 # Success - silent unless debugging
                 print(f"Parsed card for {author.name}: {result['name']}, "
                       f"{result['badges']} badges, {result['time']}, {result['pokedex']} Pokedex")
+                return True
 
             except ValueError as e:
                 # Failed to parse trainer card
@@ -208,6 +253,7 @@ class RosemaryBot(commands.Bot):
                             f"Please try posting a clearer screenshot."
                         )
                 print(f"Failed to parse card for {author.name}: {e}")
+                return False
 
         except Exception as e:
             if not silent and channel:
@@ -215,6 +261,7 @@ class RosemaryBot(commands.Bot):
                     f"{author.mention} I encountered an error processing your image: {e}"
                 )
             print(f"Error processing image from {author.name}: {e}")
+            return False
 
         finally:
             # Clean up temporary file
@@ -238,11 +285,10 @@ def create_bot(channel_id: int) -> RosemaryBot:
         progress = bot.data_store.get_user_progress(user_id)
 
         if not progress or not progress['badge_records']:
-            await interaction.response.send_message(
-                "I don't have any trainer card data for you yet. "
-                "Post a screenshot of your trainer card to get started!",
-                ephemeral=True
-            )
+            message = "I don't have any trainer card data for you yet. Post a screenshot of your trainer card to get started!"
+            if bot.processing_history:
+                message += "\n\n⚠️ Note: I'm still processing message history, so this data may be incomplete."
+            await interaction.response.send_message(message, ephemeral=True)
             return
 
         # Build the response
@@ -264,6 +310,10 @@ def create_bot(channel_id: int) -> RosemaryBot:
                 inline=True
             )
 
+        # Add warning if still processing
+        if bot.processing_history:
+            embed.set_footer(text="⚠️ Still processing message history - data may be incomplete")
+
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @bot.tree.command(name="rosemary-gym-tracker", description="View all trainers' latest progress")
@@ -272,10 +322,10 @@ def create_bot(channel_id: int) -> RosemaryBot:
         trainers = bot.data_store.get_all_trainers_latest()
 
         if not trainers:
-            await interaction.response.send_message(
-                "No trainer data recorded yet!",
-                ephemeral=True
-            )
+            message = "No trainer data recorded yet!"
+            if bot.processing_history:
+                message += "\n\n⚠️ Note: I'm still processing message history, so this data may be incomplete."
+            await interaction.response.send_message(message, ephemeral=True)
             return
 
         # Sort by badge count (descending), then by time (ascending)
@@ -301,15 +351,19 @@ def create_bot(channel_id: int) -> RosemaryBot:
                 inline=True
             )
 
+        # Add warning if still processing
+        if bot.processing_history:
+            embed.set_footer(text="⚠️ Still processing message history - data may be incomplete")
+
         await interaction.response.send_message(embed=embed)
 
     @bot.tree.command(name="rosemary-scores", description="View current score standings")
     async def rosemary_scores(interaction: discord.Interaction):
         """Show current scores (placeholder)."""
-        await interaction.response.send_message(
-            "**Rosemary Scores**\n\nTo be implemented.",
-            ephemeral=True
-        )
+        message = "**Rosemary Scores**\n\nTo be implemented."
+        if bot.processing_history:
+            message += "\n\n⚠️ Note: I'm still processing message history, so data may be incomplete."
+        await interaction.response.send_message(message, ephemeral=True)
 
     return bot
 

@@ -23,8 +23,18 @@ class TrainerDataStore:
                     return json.load(f)
             except (json.JSONDecodeError, IOError) as e:
                 print(f"Warning: Could not load {self.data_file}: {e}")
-                return {'users': {}, 'processed_messages': []}
-        return {'users': {}, 'processed_messages': []}
+                return {
+                    'users': {},
+                    'processed_messages': [],
+                    'last_processed_message_id': None,
+                    'last_processed_timestamp': None
+                }
+        return {
+            'users': {},
+            'processed_messages': [],
+            'last_processed_message_id': None,
+            'last_processed_timestamp': None
+        }
 
     def _save_data(self):
         """Save data to JSON file."""
@@ -183,3 +193,28 @@ class TrainerDataStore:
     def is_message_processed(self, message_id: str) -> bool:
         """Check if a message has already been processed."""
         return str(message_id) in self.data.get('processed_messages', [])
+
+    def get_last_processed_message(self) -> Optional[int]:
+        """
+        Get the last processed message ID.
+
+        Returns:
+            Message ID as integer, or None if no messages have been processed
+        """
+        msg_id = self.data.get('last_processed_message_id')
+        return int(msg_id) if msg_id else None
+
+    def update_last_processed_message(self, message_id: int, timestamp: Optional[datetime] = None):
+        """
+        Update the last processed message ID and timestamp.
+
+        Args:
+            message_id: Discord message ID
+            timestamp: When the message was created
+        """
+        self.data['last_processed_message_id'] = str(message_id)
+        if timestamp:
+            self.data['last_processed_timestamp'] = timestamp.isoformat()
+        else:
+            self.data['last_processed_timestamp'] = datetime.now().isoformat()
+        self._save_data()
