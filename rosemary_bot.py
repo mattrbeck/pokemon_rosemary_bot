@@ -114,18 +114,20 @@ class RosemaryBot(commands.Bot):
 
             print(f"Found {total_images} images to process using process pool")
 
-            # Process images in batches with process pool
-            batch_size = 8  # Download 8 images at a time
+            # Process images in smaller batches to avoid overwhelming the process pool
+            batch_size = 4  # Process 4 images at a time (matches worker count)
             processed_count = 0
 
-            # Create process pool executor with 4 workers
+            # Create process pool executor with 2 workers (more conservative to avoid crashes)
             loop = asyncio.get_event_loop()
-            with ProcessPoolExecutor(max_workers=4) as executor:
+            with ProcessPoolExecutor(max_workers=2) as executor:
                 for batch_start in range(0, len(image_jobs), batch_size):
                     batch_end = min(batch_start + batch_size, len(image_jobs))
                     batch = image_jobs[batch_start:batch_end]
 
-                    print(f"Processing batch {batch_start // batch_size + 1} ({len(batch)} images)...")
+                    batch_num = batch_start // batch_size + 1
+                    total_batches = (len(image_jobs) + batch_size - 1) // batch_size
+                    print(f"Processing batch {batch_num}/{total_batches} ({len(batch)} images)...")
 
                     # Download all images in this batch (async, in parallel)
                     download_tasks = []
@@ -134,32 +136,24 @@ class RosemaryBot(commands.Bot):
 
                     temp_files = await asyncio.gather(*download_tasks)
 
-                    # Prepare parsing tasks for process pool
-                    parse_tasks = []
-                    job_metadata = []
+                    # Process each image in the batch
                     for idx, temp_file in enumerate(temp_files):
-                        if temp_file:
-                            # Submit to process pool
-                            attachment, author, timestamp, message = batch[idx]
+                        if not temp_file:
+                            continue
+
+                        attachment, author, timestamp, message = batch[idx]
+
+                        try:
+                            # Submit to process pool with timeout
                             parse_task = loop.run_in_executor(
                                 executor,
                                 self._safe_parse_trainer_card,
                                 temp_file
                             )
-                            parse_tasks.append(parse_task)
-                            job_metadata.append((author, timestamp, message, temp_file))
 
-                    if not parse_tasks:
-                        continue
+                            # Wait for result with timeout (30 seconds per image)
+                            result = await asyncio.wait_for(parse_task, timeout=30.0)
 
-                    # Wait for all parsing tasks to complete (runs in parallel across 4 processes)
-                    parse_results = await asyncio.gather(*parse_tasks)
-
-                    # Process results and store data
-                    for idx, result in enumerate(parse_results):
-                        author, timestamp, message, temp_file = job_metadata[idx]
-
-                        try:
                             if result and 'error' not in result:
                                 # Success - store the data
                                 self.data_store.record_trainer_card(
@@ -177,11 +171,19 @@ class RosemaryBot(commands.Bot):
                             else:
                                 # Failed to parse
                                 error = result.get('error', 'Unknown error') if result else 'No result'
-                                print(f"  Failed to parse card for {author.name}: {error}")
+                                print(f"  [{processed_count + 1}/{total_images}] Failed to parse card for {author.name}: {error}")
+
+                        except asyncio.TimeoutError:
+                            print(f"  [{processed_count + 1}/{total_images}] Timeout parsing card for {author.name}")
+                        except Exception as e:
+                            print(f"  [{processed_count + 1}/{total_images}] Error parsing card for {author.name}: {e}")
                         finally:
                             # Clean up temp file
                             if temp_file and os.path.exists(temp_file):
-                                os.unlink(temp_file)
+                                try:
+                                    os.unlink(temp_file)
+                                except:
+                                    pass
 
                     # Yield to event loop between batches
                     await asyncio.sleep(0.1)
@@ -214,9 +216,30 @@ class RosemaryBot(commands.Bot):
             Dictionary with parsed data or error
         """
         try:
-            return parse_trainer_card(image_path)
+            # Verify file exists and is readable
+            if not os.path.exists(image_path):
+                return {'error': f'File not found: {image_path}'}
+
+            if os.path.getsize(image_path) == 0:
+                return {'error': 'Empty file'}
+
+            # Import here to avoid issues with multiprocessing on some systems
+            import sys
+            import signal
+
+            # Parse the card
+            result = parse_trainer_card(image_path)
+            return result
+
+        except KeyboardInterrupt:
+            return {'error': 'Interrupted'}
+        except MemoryError:
+            return {'error': 'Out of memory'}
         except Exception as e:
-            return {'error': str(e)}
+            # Capture full error info
+            import traceback
+            error_details = f"{type(e).__name__}: {str(e)}"
+            return {'error': error_details}
 
     async def on_message(self, message: discord.Message):
         """Handle new messages."""
