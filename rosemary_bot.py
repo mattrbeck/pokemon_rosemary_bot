@@ -8,7 +8,8 @@ import os
 import aiohttp
 import tempfile
 import asyncio
-from typing import Optional, List
+from multiprocessing import Pool
+from typing import Optional, List, Tuple
 from datetime import datetime
 
 from trainer_card_parser import parse_trainer_card
@@ -71,15 +72,10 @@ class RosemaryBot(commands.Bot):
 
         if last_processed_id:
             print(f"Resuming from message ID {last_processed_id}")
-            # Create a dummy message object with just the ID to use as 'after' parameter
             after_snowflake = discord.Object(id=last_processed_id)
         else:
             print("Starting from beginning of channel history")
             after_snowflake = None
-
-        message_count = 0
-        image_count = 0
-        processed_image_count = 0
 
         try:
             # Fetch messages after the last processed one, from oldest to newest
@@ -98,44 +94,126 @@ class RosemaryBot(commands.Bot):
 
             print(f"Found {len(messages)} new messages to process")
 
-            for idx, message in enumerate(messages):
-                message_count += 1
-
-                # Process attachments
+            # Collect all images to process
+            image_jobs = []  # List of (attachment, author, timestamp, message)
+            for message in messages:
                 if message.attachments:
                     for attachment in message.attachments:
                         if self._is_image(attachment):
-                            image_count += 1
-                            print(f"Processing image {image_count} from {message.author.name}...")
-                            success = await self._process_image(
-                                attachment,
-                                message.author,
-                                message.created_at,
-                                silent=True  # Don't send error messages for historical data
-                            )
-                            if success:
-                                processed_image_count += 1
+                            image_jobs.append((attachment, message.author, message.created_at, message))
 
-                            # Rate limit: small delay between images to prevent blocking
-                            await asyncio.sleep(0.5)
+            total_images = len(image_jobs)
+            if total_images == 0:
+                print("No images to process")
+                # Still mark messages as processed
+                for message in messages:
+                    self.data_store.mark_message_processed(message.id)
+                    self.data_store.update_last_processed_message(message.id, message.created_at)
+                self.processing_history = False
+                return
 
-                # Mark as processed (keep for backwards compatibility)
+            print(f"Found {total_images} images to process using process pool")
+
+            # Process images in batches with process pool
+            batch_size = 8  # Process 8 images at a time
+            processed_count = 0
+
+            # Create process pool with 4 workers
+            with Pool(processes=4) as pool:
+                for batch_start in range(0, len(image_jobs), batch_size):
+                    batch_end = min(batch_start + batch_size, len(image_jobs))
+                    batch = image_jobs[batch_start:batch_end]
+
+                    print(f"Processing batch {batch_start // batch_size + 1} ({len(batch)} images)...")
+
+                    # Download all images in this batch (async, in parallel)
+                    download_tasks = []
+                    for attachment, author, timestamp, message in batch:
+                        download_tasks.append(self._download_image(attachment))
+
+                    temp_files = await asyncio.gather(*download_tasks)
+
+                    # Prepare jobs for process pool (only valid downloads)
+                    parse_jobs = []
+                    job_metadata = []
+                    for idx, temp_file in enumerate(temp_files):
+                        if temp_file:
+                            parse_jobs.append(temp_file)
+                            attachment, author, timestamp, message = batch[idx]
+                            job_metadata.append((author, timestamp, message, temp_file))
+
+                    if not parse_jobs:
+                        continue
+
+                    # Submit all parsing jobs to process pool (runs in parallel)
+                    loop = asyncio.get_event_loop()
+                    parse_results = await loop.run_in_executor(
+                        None,
+                        lambda: pool.map(self._safe_parse_trainer_card, parse_jobs)
+                    )
+
+                    # Process results and store data
+                    for idx, result in enumerate(parse_results):
+                        author, timestamp, message, temp_file = job_metadata[idx]
+
+                        try:
+                            if result and 'error' not in result:
+                                # Success - store the data
+                                self.data_store.record_trainer_card(
+                                    discord_user_id=str(author.id),
+                                    trainer_name=result['name'],
+                                    badges=result['badges'],
+                                    time=result['time'],
+                                    pokedex=result['pokedex'],
+                                    message_timestamp=timestamp
+                                )
+                                processed_count += 1
+                                print(f"  [{processed_count}/{total_images}] Parsed card for {author.name}: "
+                                      f"{result['name']}, {result['badges']} badges, {result['time']}, "
+                                      f"{result['pokedex']} Pokedex")
+                            else:
+                                # Failed to parse
+                                error = result.get('error', 'Unknown error') if result else 'No result'
+                                print(f"  Failed to parse card for {author.name}: {error}")
+                        finally:
+                            # Clean up temp file
+                            if temp_file and os.path.exists(temp_file):
+                                os.unlink(temp_file)
+
+                    # Yield to event loop between batches
+                    await asyncio.sleep(0.1)
+
+            # Mark all messages as processed
+            for message in messages:
                 self.data_store.mark_message_processed(message.id)
-
-                # Update the last processed message
                 self.data_store.update_last_processed_message(message.id, message.created_at)
 
-                # Yield control to event loop every few messages
-                if idx % 10 == 0:
-                    await asyncio.sleep(0)
-
-            print(f"Processed {message_count} messages with {processed_image_count}/{image_count} images successfully")
+            print(f"Processed {len(messages)} messages with {processed_count}/{total_images} images successfully")
             print("Channel history processing complete")
 
         except Exception as e:
             print(f"Error processing channel history: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             self.processing_history = False
+
+    @staticmethod
+    def _safe_parse_trainer_card(image_path: str) -> dict:
+        """
+        Safely parse a trainer card, catching exceptions.
+        This is a static method so it can be used with multiprocessing.
+
+        Args:
+            image_path: Path to the image file
+
+        Returns:
+            Dictionary with parsed data or error
+        """
+        try:
+            return parse_trainer_card(image_path)
+        except Exception as e:
+            return {'error': str(e)}
 
     async def on_message(self, message: discord.Message):
         """Handle new messages."""
@@ -175,6 +253,31 @@ class RosemaryBot(commands.Bot):
             return attachment.content_type.startswith('image/')
         # Fallback: check file extension
         return attachment.filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp'))
+
+    async def _download_image(self, attachment: discord.Attachment) -> Optional[str]:
+        """
+        Download an image attachment to a temporary file.
+
+        Args:
+            attachment: Discord attachment to download
+
+        Returns:
+            Path to temporary file, or None on failure
+        """
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(attachment.url) as resp:
+                    if resp.status != 200:
+                        return None
+
+                    # Save to temporary file
+                    with tempfile.NamedTemporaryFile(mode='wb', suffix='.png', delete=False) as f:
+                        temp_file = f.name
+                        f.write(await resp.read())
+                    return temp_file
+        except Exception as e:
+            print(f"Error downloading image: {e}")
+            return None
 
     async def _process_image(self, attachment: discord.Attachment,
                             author: discord.User,
