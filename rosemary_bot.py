@@ -8,7 +8,7 @@ import os
 import aiohttp
 import tempfile
 import asyncio
-from multiprocessing import Pool
+from concurrent.futures import ProcessPoolExecutor
 from typing import Optional, List, Tuple
 from datetime import datetime
 
@@ -115,11 +115,12 @@ class RosemaryBot(commands.Bot):
             print(f"Found {total_images} images to process using process pool")
 
             # Process images in batches with process pool
-            batch_size = 8  # Process 8 images at a time
+            batch_size = 8  # Download 8 images at a time
             processed_count = 0
 
-            # Create process pool with 4 workers
-            with Pool(processes=4) as pool:
+            # Create process pool executor with 4 workers
+            loop = asyncio.get_event_loop()
+            with ProcessPoolExecutor(max_workers=4) as executor:
                 for batch_start in range(0, len(image_jobs), batch_size):
                     batch_end = min(batch_start + batch_size, len(image_jobs))
                     batch = image_jobs[batch_start:batch_end]
@@ -133,24 +134,26 @@ class RosemaryBot(commands.Bot):
 
                     temp_files = await asyncio.gather(*download_tasks)
 
-                    # Prepare jobs for process pool (only valid downloads)
-                    parse_jobs = []
+                    # Prepare parsing tasks for process pool
+                    parse_tasks = []
                     job_metadata = []
                     for idx, temp_file in enumerate(temp_files):
                         if temp_file:
-                            parse_jobs.append(temp_file)
+                            # Submit to process pool
                             attachment, author, timestamp, message = batch[idx]
+                            parse_task = loop.run_in_executor(
+                                executor,
+                                self._safe_parse_trainer_card,
+                                temp_file
+                            )
+                            parse_tasks.append(parse_task)
                             job_metadata.append((author, timestamp, message, temp_file))
 
-                    if not parse_jobs:
+                    if not parse_tasks:
                         continue
 
-                    # Submit all parsing jobs to process pool (runs in parallel)
-                    loop = asyncio.get_event_loop()
-                    parse_results = await loop.run_in_executor(
-                        None,
-                        lambda: pool.map(self._safe_parse_trainer_card, parse_jobs)
-                    )
+                    # Wait for all parsing tasks to complete (runs in parallel across 4 processes)
+                    parse_results = await asyncio.gather(*parse_tasks)
 
                     # Process results and store data
                     for idx, result in enumerate(parse_results):
